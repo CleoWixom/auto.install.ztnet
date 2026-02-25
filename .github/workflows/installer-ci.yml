@@ -1,0 +1,22 @@
+name: installer-ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  validate-installer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bash syntax check
+        run: bash -n ztnet.sh
+
+      - name: Run ExitNode structure tests
+        run: bash tests/test_exitnode_section.sh
+
+      - name: Run ExitNode scenario tests
+        run: bash tests/test_exitnode_scenario.sh
