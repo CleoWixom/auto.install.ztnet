@@ -6,7 +6,8 @@ TMPROOT=$(mktemp -d)
 trap 'rm -rf "$TMPROOT"' EXIT
 
 FAKEBIN="$TMPROOT/fakebin"
-mkdir -p "$FAKEBIN"
+mkdir -p "$FAKEBIN" "$TMPROOT/var/lib/zerotier-one"
+printf 'ztauth' > "$TMPROOT/var/lib/zerotier-one/authtoken.secret"
 
 cat > "$FAKEBIN/curl" <<'CURL_EOF'
 #!/usr/bin/env bash
@@ -41,7 +42,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [[ "$url" == *"/api/healthcheck"* ]]; then
+if [[ "$url" == *":3000" && "$url" != *"/api/"* ]]; then
   [ -n "$write_fmt" ] && printf '200'
   exit 0
 fi
@@ -56,17 +57,17 @@ if [[ "$method" == "POST" && "$url" == *"/api/v1/network" ]]; then
   exit 0
 fi
 
-if [[ "$method" == "PUT" && "$url" == *"/api/v1/network/abcdef1234567890" ]]; then
-  printf '{"ok":true}'
-  exit 0
-fi
-
-if [[ "$method" == "GET" && "$url" == *"/member/a1b2c3d4e5" ]]; then
+if [[ "$url" == *"/controller/network/abcdef1234567890/member/a1b2c3d4e5"* ]]; then
   printf '{"id":"a1b2c3d4e5"}'
   exit 0
 fi
 
-if [[ "$method" == "POST" && "$url" == *"/member/a1b2c3d4e5" ]]; then
+if [[ "$method" == "POST" && "$url" == *"/controller/network/abcdef1234567890"* ]]; then
+  printf '{"ok":true}'
+  exit 0
+fi
+
+if [[ "$method" == "POST" && "$url" == *"/api/v1/network/abcdef1234567890/member/a1b2c3d4e5"* ]]; then
   printf '{"authorized":true}'
   exit 0
 fi
@@ -102,9 +103,24 @@ OUT
   exit 0
 fi
 
+if [[ "${1:-}" == "route" && "${2:-}" == "show" && "${3:-}" == "default" ]]; then
+  echo "default via 10.0.2.2 dev eth0"
+  exit 0
+fi
+
 exit 0
 IP_EOF
 chmod +x "$FAKEBIN/ip"
+
+cat > "$FAKEBIN/systemctl" <<'SC_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "is-active" && "${2:-}" == "--quiet" && "${3:-}" == "ztnet" ]]; then
+  exit 0
+fi
+exit 0
+SC_EOF
+chmod +x "$FAKEBIN/systemctl"
 
 export PATH="$FAKEBIN:$PATH"
 
@@ -118,14 +134,15 @@ verbose() { "$@"; }
 print_status() { :; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-awk 'f{print} /^# ===========================================================================$/{if (seen==0){seen=1;f=1;print}}' "$SCRIPT" \
+awk 'f{print} /^cd \/root \|\| cd \/$/{f=1} ' "$SCRIPT" \
   | sed "s|/etc/ztnet|$TMPROOT/etc_ztnet|g" \
+  | sed "s|/var/lib/zerotier-one/authtoken.secret|$TMPROOT/var/lib/zerotier-one/authtoken.secret|g" \
   | sed -E '/^exitnode_[a-z0-9_]+[[:space:]]*$/d' > "$TMPROOT/exitnode_section.sh"
 
 # shellcheck disable=SC1090
 source "$TMPROOT/exitnode_section.sh"
 
-exitnode_wait_api
+exitnode_wait_ztnet
 exitnode_create_admin
 [ "$(cat "$API_TOKEN_FILE")" = "tok123" ]
 

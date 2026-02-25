@@ -1175,121 +1175,122 @@ echo -e "- Environment variables can be changed in ${YELLOW}/opt/ztnet/.env${NC}
 
 echo -e "\n\nZTnet is waiting for you at: ${YELLOW}${server_ip}:3000${NC}\n\n"
 
-# ===========================================================================
-# EXITNODE SETUP — appended to ztnet.sh
-# ===========================================================================
 cd /root || cd /
 
+# --- конфигурация ---
 ZTNET_API="${server_ip}:3000/api/v1"
+ZT_CONTROLLER_API="http://localhost:9993/controller"
+ZT_AUTH_TOKEN_FILE="/var/lib/zerotier-one/authtoken.secret"
+# Source: https://docs.zerotier.com/api/service/v1/
+# "ZeroTier One saves this token in the authtoken.secret file"
+# "Linux :: /var/lib/zerotier-one"
+
 API_TOKEN_FILE="/etc/ztnet/api_token"
 NETWORK_ID_FILE="/etc/ztnet/network_id"
 DNS_ZONE="ztnet.local"
-mkdir -p /etc/ztnet
-chmod 700 /etc/ztnet
+mkdir -p /etc/ztnet && chmod 700 /etc/ztnet
 
 exitnode_die() {
-    printf "\n${RED}[EXITNODE ERROR]${NC} %s\n" "$*"
+    printf "
+${RED}[EXITNODE ERROR]${NC} %s
+" "$*"
     exit 1
 }
 
 exitnode_patch_zerotier() {
-    print_status "Patching zerotier-one service for userland mode..."
-    local service_file="/lib/systemd/system/zerotier-one.service"
+    print_status "Patching zerotier-one.service with -U..."
+    SERVICE_FILE="/lib/systemd/system/zerotier-one.service"
+    [ -f "$SERVICE_FILE" ] || exitnode_die "File $SERVICE_FILE not found"
 
-    [ -f "$service_file" ] || exitnode_die "Missing service file: $service_file"
-    cp "$service_file" "${service_file}.bak" || exitnode_die "Failed to backup $service_file"
-
-    if grep -q '^ExecStart=/usr/sbin/zerotier-one -U$' "$service_file"; then
-        print_status "zerotier-one service already patched."
+    if grep -q '^ExecStart=/usr/sbin/zerotier-one -U$' "$SERVICE_FILE"; then
+        print_status "zerotier-one.service already patched with -U."
     else
-        sed -i 's|^ExecStart=/usr/sbin/zerotier-one$|ExecStart=/usr/sbin/zerotier-one -U|' "$service_file"
+        cp "$SERVICE_FILE" "${SERVICE_FILE}.bak" || exitnode_die "Failed to backup $SERVICE_FILE"
+        sed -i 's|^ExecStart=/usr/sbin/zerotier-one$|ExecStart=/usr/sbin/zerotier-one -U|' "$SERVICE_FILE"
+        grep -q '^ExecStart=/usr/sbin/zerotier-one -U$' "$SERVICE_FILE" || exitnode_die "sed replacement failed"
     fi
 
-    grep -q '^ExecStart=/usr/sbin/zerotier-one -U$' "$service_file" || exitnode_die "Failed to patch ExecStart in $service_file"
-
     systemctl daemon-reload || exitnode_die "systemctl daemon-reload failed"
-    systemctl restart zerotier-one || exitnode_die "Failed to restart zerotier-one"
+    systemctl restart zerotier-one || exitnode_die "systemctl restart zerotier-one failed"
 
-    local attempt
-    for attempt in $(seq 1 15); do
-        if zerotier-cli status >/dev/null 2>&1; then
-            print_status "zerotier-one is running."
-            return 0
-        fi
+    local i
+    for i in $(seq 1 15); do
+        zerotier-cli status >/dev/null 2>&1 && return 0
         sleep 2
     done
 
-    exitnode_die "zerotier-cli status timeout after 30s"
+    exitnode_die "zerotier-cli status timeout"
 }
 
-exitnode_wait_api() {
-    print_status "Waiting for ZTNET API healthcheck..."
-    local attempt code
+exitnode_wait_ztnet() {
+    print_status "Waiting for ztnet service to be active..."
+    local i code
 
-    for attempt in $(seq 1 40); do
-        code=$(curl -s -o /dev/null -w "%{http_code}" "${server_ip}:3000/api/healthcheck")
-        if [ "$code" = "200" ] || [ "$code" = "404" ]; then
-            print_status "ZTNET API is reachable (HTTP $code)."
+    for i in $(seq 1 40); do
+        if systemctl is-active --quiet ztnet; then
+            break
+        fi
+        sleep 3
+    done
+
+    systemctl is-active --quiet ztnet || exitnode_die "ztnet service did not become active in time"
+
+    print_status "Waiting for ZTNET HTTP on port 3000..."
+    for i in $(seq 1 40); do
+        code=$(curl -s -o /dev/null -w "%{http_code}" "${server_ip}:3000")
+        if echo "$code" | grep -qE '^[23]'; then
             return 0
         fi
         sleep 3
     done
 
-    exitnode_die "ZTNET API did not become ready within 120s"
+    exitnode_die "ZTNET HTTP endpoint did not respond with 2xx/3xx in time"
 }
 
 exitnode_create_admin() {
-    print_status "Creating ZTNET admin user and API token..."
+    print_status "Creating first admin user and API token..."
+
     ADMIN_EMAIL="${ZTNET_ADMIN_EMAIL:-admin@localhost.local}"
     ADMIN_PASSWORD=$(openssl rand -hex 16)
 
-    local PAYLOAD RESPONSE
-    PAYLOAD=$(jq -n \
-        --arg email "$ADMIN_EMAIL" \
-        --arg password "$ADMIN_PASSWORD" \
-        --arg name "Administrator" \
-        '{email: $email, password: $password, name: $name, expiresAt: null, generateApiToken: true}')
+    PAYLOAD=$(jq -n       --arg email "$ADMIN_EMAIL"       --arg password "$ADMIN_PASSWORD"       --arg name "Administrator"       '{email: $email, password: $password, name: $name, expiresAt: null, generateApiToken: true}')
 
-    RESPONSE=$(curl -s -X POST \
-        -H "Content-Type: application/json" \
-        -d "$PAYLOAD" \
-        "${ZTNET_API}/user")
+    RESPONSE=$(curl -s -X POST       -H "Content-Type: application/json"       -d "$PAYLOAD"       "${ZTNET_API}/user")
 
     API_TOKEN=$(echo "$RESPONSE" | jq -r '.apiToken // .token // empty')
     if [ -z "$API_TOKEN" ] || [ "$API_TOKEN" = "null" ]; then
-        printf '%s\n' "$RESPONSE" >&2
-        exitnode_die "Failed to extract API token from user creation response"
+        printf '%s
+' "$RESPONSE" >&2
+        exitnode_die "Failed to get API token from user creation response"
     fi
 
-    echo -n "$API_TOKEN" > "$API_TOKEN_FILE" || exitnode_die "Failed to write API token"
-    chmod 600 "$API_TOKEN_FILE" || exitnode_die "Failed to chmod API token file"
+    echo -n "$API_TOKEN" > "$API_TOKEN_FILE" || exitnode_die "Failed writing $API_TOKEN_FILE"
+    chmod 600 "$API_TOKEN_FILE" || exitnode_die "Failed chmod on $API_TOKEN_FILE"
 }
 
 exitnode_create_network() {
-    print_status "Creating ZeroTier network in ZTNET controller..."
-    local RESPONSE
+    print_status "Creating ZeroTier network via ZTNET API..."
 
-    RESPONSE=$(curl -s -X POST \
-        -H "Content-Type: application/json" \
-        -H "x-ztnet-auth: $(cat "$API_TOKEN_FILE")" \
-        -d '{}' \
-        "${ZTNET_API}/network")
+    RESPONSE=$(curl -s -X POST       -H "Content-Type: application/json"       -H "x-ztnet-auth: $(cat "$API_TOKEN_FILE")"       -d '{}'       "${ZTNET_API}/network")
 
     NETWORK_ID=$(echo "$RESPONSE" | jq -r '.id // .nwid // empty')
     if [ -z "$NETWORK_ID" ] || [ "$NETWORK_ID" = "null" ]; then
-        printf '%s\n' "$RESPONSE" >&2
+        printf '%s
+' "$RESPONSE" >&2
         exitnode_die "Failed to create network"
     fi
 
-    echo -n "$NETWORK_ID" > "$NETWORK_ID_FILE" || exitnode_die "Failed to write network id"
-    chmod 600 "$NETWORK_ID_FILE" || exitnode_die "Failed to chmod network id file"
+    echo -n "$NETWORK_ID" > "$NETWORK_ID_FILE" || exitnode_die "Failed writing $NETWORK_ID_FILE"
+    chmod 600 "$NETWORK_ID_FILE" || exitnode_die "Failed chmod on $NETWORK_ID_FILE"
 }
 
 exitnode_configure_network() {
-    print_status "Configuring ZeroTier network settings..."
+    print_status "Configuring network via ZeroTier Controller API..."
 
-    local NETWORK_BODY RESPONSE
-    NETWORK_BODY=$(jq -n '{
+    ZT_AUTH=$(cat "$ZT_AUTH_TOKEN_FILE")
+    NETWORK_ID=$(cat "$NETWORK_ID_FILE")
+
+    PAYLOAD=$(jq -n '{
       "private": true,
       "v4AssignMode": { "zt": true },
       "v6AssignMode": { "6plane": true, "rfc4193": false, "zt": false },
@@ -1302,34 +1303,24 @@ exitnode_configure_network() {
       ]
     }')
 
-    RESPONSE=$(curl -s -X PUT \
-        -H "Content-Type: application/json" \
-        -H "x-ztnet-auth: $(cat "$API_TOKEN_FILE")" \
-        -d "$NETWORK_BODY" \
-        "${ZTNET_API}/network/$(cat "$NETWORK_ID_FILE")")
-
-    if echo "$RESPONSE" | jq -e '.error' >/dev/null 2>&1; then
-        printf '%s\n' "$RESPONSE" >&2
-        exitnode_die "Failed to configure network settings"
-    fi
+    curl -s -X POST       -H "Content-Type: application/json"       -H "X-ZT1-AUTH: ${ZT_AUTH}"       -d "$PAYLOAD"       "${ZT_CONTROLLER_API}/network/${NETWORK_ID}" > /dev/null || exitnode_die "Controller network config call failed"
 }
 
 exitnode_join_network() {
-    print_status "Joining ExitNode to the new ZeroTier network..."
+    print_status "Joining ExitNode to network..."
+
     NETWORK_ID=$(cat "$NETWORK_ID_FILE")
 
     zerotier-cli join "$NETWORK_ID" || exitnode_die "join failed"
-    zerotier-cli set "$NETWORK_ID" allowGlobal=1 allowManaged=1 || exitnode_die "Failed to set allowGlobal/allowManaged"
+    zerotier-cli set "$NETWORK_ID" allowGlobal=1 allowManaged=1 || exitnode_die "set allowGlobal/allowManaged failed"
 
     NODE_ID=$(zerotier-cli info | awk '{print $3}')
     [ -z "$NODE_ID" ] && exitnode_die "Cannot get NODE_ID"
 
-    local attempt
-    for attempt in $(seq 1 30); do
+    local i
+    for i in $(seq 1 30); do
         ZT_INTERFACE=$(ip link show | grep -oP 'zt\w+' | head -1)
-        if [ -n "$ZT_INTERFACE" ]; then
-            return 0
-        fi
+        [ -n "$ZT_INTERFACE" ] && return 0
         sleep 2
     done
 
@@ -1337,77 +1328,67 @@ exitnode_join_network() {
 }
 
 exitnode_authorize() {
-    print_status "Authorizing ExitNode member and assigning static IPs..."
+    print_status "Authorizing member and assigning static IP..."
+
+    ZT_AUTH=$(cat "$ZT_AUTH_TOKEN_FILE")
     NETWORK_ID=$(cat "$NETWORK_ID_FILE")
+    API_TOKEN=$(cat "$API_TOKEN_FILE")
 
-    local attempt MEMBER_RESPONSE AUTH_RESPONSE ROUTE_BODY
+    local i MEMBER_JSON AUTH_RESPONSE
 
-    for attempt in $(seq 1 20); do
-        MEMBER_RESPONSE=$(curl -s \
-            -H "x-ztnet-auth: $(cat "$API_TOKEN_FILE")" \
-            "${ZTNET_API}/network/${NETWORK_ID}/member/${NODE_ID}")
+    for i in $(seq 1 20); do
+        MEMBER_JSON=$(curl -s           -H "X-ZT1-AUTH: ${ZT_AUTH}"           "${ZT_CONTROLLER_API}/network/${NETWORK_ID}/member/${NODE_ID}")
 
-        if ! echo "$MEMBER_RESPONSE" | jq -e '.error' >/dev/null 2>&1; then
+        if [ -n "$(echo "$MEMBER_JSON" | jq -r '.id // empty')" ]; then
             break
         fi
         sleep 3
     done
 
-    if echo "$MEMBER_RESPONSE" | jq -e '.error' >/dev/null 2>&1; then
-        exitnode_die "Member did not appear in controller within timeout"
+    if [ -z "$(echo "$MEMBER_JSON" | jq -r '.id // empty')" ]; then
+        exitnode_die "Member did not appear in controller in time"
     fi
 
-    AUTH_RESPONSE=$(curl -s -X POST \
-        -H "Content-Type: application/json" \
-        -H "x-ztnet-auth: $(cat "$API_TOKEN_FILE")" \
-        -d "$(jq -n '{"authorized": true, "noAutoAssignIps": true, "ipAssignments": ["192.168.55.1"]}')" \
-        "${ZTNET_API}/network/${NETWORK_ID}/member/${NODE_ID}")
+    AUTH_RESPONSE=$(curl -s -X POST       -H "Content-Type: application/json"       -H "x-ztnet-auth: ${API_TOKEN}"       -d "$(jq -n '{authorized: true, noAutoAssignIps: true, ipAssignments: ["192.168.55.1"]}')"       "${ZTNET_API}/network/${NETWORK_ID}/member/${NODE_ID}")
 
     if [ "$(echo "$AUTH_RESPONSE" | jq -r '.authorized // empty')" != "true" ]; then
-        printf '%s\n' "$AUTH_RESPONSE" >&2
-        exitnode_die "Failed to authorize member"
+        printf '%s
+' "$AUTH_RESPONSE" >&2
+        exitnode_die "Failed to authorize member via ZTNET API"
     fi
 
     [ "${#NETWORK_ID}" -eq 16 ] || exitnode_die "NETWORK_ID must be 16 hex chars"
-    local TOP BOT HASHED
     TOP="${NETWORK_ID:0:8}"
     BOT="${NETWORK_ID:8:8}"
     HASHED=$(printf '%08x' "$(( 0x${TOP} ^ 0x${BOT} ))")
     SIXPLANE_IP="fc${HASHED:0:2}:${HASHED:2:4}:${HASHED:6:2}${NODE_ID:0:2}:${NODE_ID:2:4}:${NODE_ID:6:4}::1"
 
-    ROUTE_BODY=$(jq -n --arg sixplane "$SIXPLANE_IP" '{
+    PAYLOAD=$(jq -n --arg six "$SIXPLANE_IP" '{
       "routes": [
         { "target": "192.168.55.0/24", "via": null },
         { "target": "0.0.0.0/0", "via": "192.168.55.1" },
-        { "target": "::/0", "via": $sixplane }
+        { "target": "::/0", "via": $six }
       ]
     }')
 
-    MEMBER_RESPONSE=$(curl -s -X PUT \
-        -H "Content-Type: application/json" \
-        -H "x-ztnet-auth: $(cat "$API_TOKEN_FILE")" \
-        -d "$ROUTE_BODY" \
-        "${ZTNET_API}/network/${NETWORK_ID}")
+    curl -s -X POST       -H "Content-Type: application/json"       -H "X-ZT1-AUTH: ${ZT_AUTH}"       -d "$PAYLOAD"       "${ZT_CONTROLLER_API}/network/${NETWORK_ID}" > /dev/null || exitnode_die "Failed to update ::/0 route"
 
-    if echo "$MEMBER_RESPONSE" | jq -e '.error' >/dev/null 2>&1; then
-        printf '%s\n' "$MEMBER_RESPONSE" >&2
-        exitnode_die "Failed adding ::/0 route"
-    fi
-
-    for attempt in $(seq 1 30); do
+    for i in $(seq 1 30); do
         if ip addr show "$ZT_INTERFACE" | grep -q "192.168.55.1"; then
             return 0
         fi
         sleep 2
     done
 
-    printf "\n${YELLOW}[EXITNODE WARNING]${NC} Timed out waiting for 192.168.55.1 on %s\n" "$ZT_INTERFACE"
+    printf "
+${YELLOW}[EXITNODE WARNING]${NC} Timed out waiting for 192.168.55.1 on %s
+" "$ZT_INTERFACE"
 }
 
 exitnode_setup_unbound() {
-    print_status "Installing and configuring Unbound DNS..."
+    print_status "Installing and configuring Unbound..."
 
-    if ! command_exists unbound || ! command_exists unbound-anchor; then
+    if ! command_exists unbound; then
         $STD apt-get install -y unbound unbound-anchor
     fi
 
@@ -1421,7 +1402,7 @@ server:
   interface: 127.0.0.1
   interface: 192.168.55.1
   port: 53
-  access-control: 127.0.0.0/8     allow
+  access-control: 127.0.0.0/8      allow
   access-control: 192.168.55.0/24  allow
   access-control: 0.0.0.0/0        refuse
   do-ip4: yes
@@ -1438,18 +1419,20 @@ forward-zone:
 UNBOUND_EOF
 
     : > /etc/unbound/ztnet-hosts.conf
-
-    unbound-checkconf || exitnode_die "unbound-checkconf failed"
-    systemctl enable --now unbound || exitnode_die "Failed enabling unbound"
-    systemctl restart unbound || exitnode_die "Failed restarting unbound"
+    unbound-checkconf || exitnode_die "unbound config error"
+    systemctl enable --now unbound || exitnode_die "Failed to enable unbound"
+    systemctl restart unbound || exitnode_die "Failed to restart unbound"
 }
 
 exitnode_install_zt2unbound() {
-    print_status "Installing zt2unbound sync utility..."
+    print_status "Installing zt2unbound utility..."
+
+    command_exists jq || exitnode_die "jq not found"
+    command_exists curl || exitnode_die "curl not found"
 
     cat > /usr/local/bin/zt2unbound <<'ZT2UNBOUND_EOF'
 #!/bin/bash
-set -u
+set -euo pipefail
 
 API_TOKEN=$(cat /etc/ztnet/api_token)
 NETWORK_ID=$(cat /etc/ztnet/network_id)
@@ -1458,43 +1441,52 @@ DNS_ZONE="ztnet.local"
 OUTPUT="/etc/unbound/ztnet-hosts.conf"
 TMP=$(mktemp)
 
-members=$(curl -sH "x-ztnet-auth: $API_TOKEN" "$ZTNET_API/network/$NETWORK_ID/member/")
-netinfo=$(curl -sH "x-ztnet-auth: $API_TOKEN" "$ZTNET_API/network/$NETWORK_ID/")
+# Source: https://ztnet.network/Rest%20Api/Personal/Network-Members/get-network-member-info
+MEMBERS=$(curl -sH "x-ztnet-auth: ${API_TOKEN}"   "${ZTNET_API}/network/${NETWORK_ID}/member/")
 
-if echo "$members" | jq -e '.error' >/dev/null 2>&1 || echo "$netinfo" | jq -e '.error' >/dev/null 2>&1; then
-  rm -f "$TMP"
-  exit 1
-fi
+# Source: https://ztnet.network/Rest%20Api/Personal/Network/get-network-info
+NETINFO=$(curl -sH "x-ztnet-auth: ${API_TOKEN}"   "${ZTNET_API}/network/${NETWORK_ID}/")
 
-sixplane_enabled=$(echo "$netinfo" | jq -r '.v6AssignMode["6plane"]')
+echo "$MEMBERS" | grep -q '"error"' && exit 1
+echo "$NETINFO"  | grep -q '"error"' && exit 1
 
+SIXPLANE=$(echo "$NETINFO" | jq -r '.v6AssignMode["6plane"]')
+
+# 6PLANE compute — source: zt2hosts script from
+# https://ztnet.network/usage/create_dns_host
 print_6plane() {
   local nodeid="$1" netid="$2"
   local TOP="${netid:0:8}" BOT="${netid:8:8}"
   local hashed
   hashed=$(printf '%08x' "$(( 0x$TOP ^ 0x$BOT ))")
-  printf "fc%s:%s:%s%s:%s:%s::1" \
-    "${hashed:0:2}" "${hashed:2:4}" "${hashed:6:2}" \
-    "${nodeid:0:2}" "${nodeid:2:4}" "${nodeid:6:4}"
+  printf "fc%s:%s:%s%s:%s:%s::1"     "${hashed:0:2}" "${hashed:2:4}" "${hashed:6:2}"     "${nodeid:0:2}" "${nodeid:2:4}" "${nodeid:6:4}"
 }
 
-echo "$members" | jq -c '.[] | select(.authorized==true)' | while read -r member; do
-  nodename=$(echo "$member" | jq -r '.name // "unnamed"' | tr '[:upper:]' '[:lower:]' | sed 's/ /_/g')
-  nodeid=$(echo "$member" | jq -r '.id')
+echo "# Auto-generated by zt2unbound $(date)" > "$TMP"
+
+echo "$MEMBERS" | jq -c   '.[] | select(.authorized == true) |   {name: (.name | gsub(" ";"_") | ascii_downcase),    id: .id, ips: .ipAssignments}' | while IFS= read -r entry; do
+  nodename=$(echo "$entry" | jq -r '.name')
+  nodeid=$(echo "$entry"   | jq -r '.id')
   fqdn="${nodename}.${DNS_ZONE}"
   idfqdn="${nodeid}.${DNS_ZONE}"
 
-  echo "$member" | jq -r '.ipAssignments[]? | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"))' | while read -r ip4; do
-    echo "local-data: \"${fqdn}. A ${ip4}\"" >> "$TMP"
-    echo "local-data: \"${idfqdn}. A ${ip4}\"" >> "$TMP"
-    echo "local-data-ptr: \"${ip4} ${fqdn}.\"" >> "$TMP"
-  done
+  while IFS= read -r ip4; do
+    printf 'local-data: "%s. A %s"
+'     "$fqdn"   "$ip4" >> "$TMP"
+    printf 'local-data: "%s. A %s"
+'     "$idfqdn" "$ip4" >> "$TMP"
+    printf 'local-data-ptr: "%s %s."
+'   "$ip4"    "$fqdn" >> "$TMP"
+  done < <(echo "$entry" | jq -r '.ips[]')
 
-  if [ "$sixplane_enabled" = "true" ]; then
+  if [ "$SIXPLANE" = "true" ]; then
     ip6=$(print_6plane "$nodeid" "$NETWORK_ID")
-    echo "local-data: \"${fqdn}. AAAA ${ip6}\"" >> "$TMP"
-    echo "local-data: \"${idfqdn}. AAAA ${ip6}\"" >> "$TMP"
-    echo "local-data-ptr: \"${ip6} ${fqdn}.\"" >> "$TMP"
+    printf 'local-data: "%s. AAAA %s"
+'   "$fqdn"   "$ip6" >> "$TMP"
+    printf 'local-data: "%s. AAAA %s"
+'   "$idfqdn" "$ip6" >> "$TMP"
+    printf 'local-data-ptr: "%s %s."
+'    "$ip6"    "$fqdn" >> "$TMP"
   fi
 done
 
@@ -1503,32 +1495,29 @@ unbound-control reload 2>/dev/null || systemctl restart unbound
 ZT2UNBOUND_EOF
 
     chmod +x /usr/local/bin/zt2unbound || exitnode_die "Failed chmod zt2unbound"
+    /usr/local/bin/zt2unbound || true
 
-    /usr/local/bin/zt2unbound || exitnode_die "Initial zt2unbound run failed"
-
-    local CRON_JOB="*/5 * * * * /usr/local/bin/zt2unbound"
-    ( crontab -l 2>/dev/null | grep -qF "$CRON_JOB" ) || \
-      ( crontab -l 2>/dev/null; echo "$CRON_JOB" ) | crontab -
+    CRON_LINE="*/5 * * * * /usr/local/bin/zt2unbound"
+    ( crontab -l 2>/dev/null | grep -qF "$CRON_LINE" ) ||       ( crontab -l 2>/dev/null; echo "$CRON_LINE" ) | crontab -
 }
 
 exitnode_setup_firewall() {
-    print_status "Configuring forwarding and firewall rules..."
+    print_status "Configuring firewall and forwarding..."
 
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null || exitnode_die "Failed to enable IPv4 forwarding"
-    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null || exitnode_die "Failed to enable IPv6 forwarding"
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null || exitnode_die "Failed to set net.ipv4.ip_forward"
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null || exitnode_die "Failed to set net.ipv6.conf.all.forwarding"
 
-    cat > /etc/sysctl.d/99-ztnet-exitnode.conf <<'SYSCTL_EOF'
+    cat > /etc/sysctl.d/99-ztnet-exitnode.conf <<'EOF_SYSCTL'
 net.ipv4.ip_forward=1
 net.ipv6.conf.all.forwarding=1
-SYSCTL_EOF
+EOF_SYSCTL
 
     WAN_IFACE=$(ip route show default | awk '/^default/{print $5}' | head -1)
     [ -z "$WAN_IFACE" ] && exitnode_die "Cannot detect WAN interface"
 
     if command_exists nft; then
-        cat > /etc/nftables.conf <<'NFT_EOF'
+        cat > /etc/nftables.conf << 'NFTEOF'
 flush ruleset
-
 table inet filter {
   chain input {
     type filter hook input priority 0; policy drop;
@@ -1536,28 +1525,27 @@ table inet filter {
     iifname "lo" accept
     tcp dport 22 accept
     udp dport 9993 accept
-    iifname "ZT_INTERFACE" ip saddr 192.168.55.0/24 udp dport 53 accept
-    iifname "ZT_INTERFACE" ip saddr 192.168.55.0/24 tcp dport 53 accept
-    ip protocol icmp accept
-    ip6 nexthdr icmpv6 accept
+    iifname "ZT_IFACE_PLACEHOLDER" ip saddr 192.168.55.0/24 udp dport 53 accept
+    iifname "ZT_IFACE_PLACEHOLDER" ip saddr 192.168.55.0/24 tcp dport 53 accept
+    ip  protocol icmp   accept
+    ip6 nexthdr  icmpv6 accept
   }
   chain forward {
     type filter hook forward priority 0; policy drop;
     ct state established,related accept
-    iifname "ZT_INTERFACE" oifname "WAN_IFACE" accept
+    iifname "ZT_IFACE_PLACEHOLDER" oifname "WAN_IFACE_PLACEHOLDER" accept
   }
   chain output { type filter hook output priority 0; policy accept; }
 }
-
 table ip nat {
   chain postrouting {
     type nat hook postrouting priority 100;
-    ip saddr 192.168.55.0/24 oifname "WAN_IFACE" masquerade
+    ip saddr 192.168.55.0/24 oifname "WAN_IFACE_PLACEHOLDER" masquerade
   }
 }
-NFT_EOF
+NFTEOF
 
-        sed -i "s|ZT_INTERFACE|${ZT_INTERFACE}|g; s|WAN_IFACE|${WAN_IFACE}|g" /etc/nftables.conf
+        sed -i           "s|ZT_IFACE_PLACEHOLDER|${ZT_INTERFACE}|g;           s|WAN_IFACE_PLACEHOLDER|${WAN_IFACE}|g"           /etc/nftables.conf
 
         systemctl enable --now nftables || exitnode_die "Failed to enable nftables"
         nft -f /etc/nftables.conf || exitnode_die "nftables config failed"
@@ -1573,25 +1561,40 @@ NFT_EOF
 }
 
 exitnode_print_summary() {
-    print_status "Printing ExitNode summary..."
-    printf "\n\n${GREEN}ExitNode setup complete!${NC}\n"
-    printf "─────────────────────────────────\n"
-    printf "ZTNET Web UI:     %s:3000\n" "$server_ip"
-    printf "Admin email:      %s\n" "$ADMIN_EMAIL"
-    printf "Admin password:   %s\n" "$ADMIN_PASSWORD"
-    printf "API token file:   %s\n" "$API_TOKEN_FILE"
-    printf "Network ID:       %s\n" "$NETWORK_ID"
-    printf "Node ID:          %s\n" "$NODE_ID"
-    printf "ZT Interface:     %s\n" "$ZT_INTERFACE"
-    printf "ExitNode IPv4:    192.168.55.1\n"
-    printf "ExitNode IPv6:    %s\n" "$SIXPLANE_IP"
-    printf "DNS:              192.168.55.1:53 (Unbound)\n"
-    printf "DNS Zone:         %s\n" "$DNS_ZONE"
-    printf "zt2unbound cron:  every 5 minutes\n\n"
+    print_status "ExitNode setup summary"
+
+    printf "
+${GREEN}ExitNode setup complete!${NC}
+"
+    printf "────────────────────────────────────────
+"
+    printf "ZTNET Web UI:     %s:3000
+" "$server_ip"
+    printf "Admin email:      %s
+" "$ADMIN_EMAIL"
+    printf "Admin password:   %s
+" "$ADMIN_PASSWORD"
+    printf "API token file:   %s
+" "$API_TOKEN_FILE"
+    printf "Network ID:       %s
+" "$NETWORK_ID"
+    printf "Node ID:          %s
+" "$NODE_ID"
+    printf "ZT Interface:     %s
+" "$ZT_INTERFACE"
+    printf "ExitNode IPv4:    192.168.55.1
+"
+    printf "ExitNode IPv6:    %s
+" "$SIXPLANE_IP"
+    printf "DNS:              192.168.55.1:53 (Unbound, zone: %s)
+" "$DNS_ZONE"
+    printf "zt2unbound:       cron every 5 min → /etc/unbound/ztnet-hosts.conf
+
+"
 }
 
 exitnode_patch_zerotier
-exitnode_wait_api
+exitnode_wait_ztnet
 exitnode_create_admin
 exitnode_create_network
 exitnode_configure_network

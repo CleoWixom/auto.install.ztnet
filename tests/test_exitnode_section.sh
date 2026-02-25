@@ -25,22 +25,22 @@ require_pattern() {
 bash -n "$SCRIPT" || fail "bash syntax check failed"
 pass "bash syntax check"
 
-# 2) ExitNode section exists after the final ZTnet URL echo line.
+# 2) Appended section starts after final ZTnet URL echo.
 line_echo=$(grep -n 'ZTnet is waiting for you at:' "$SCRIPT" | tail -1 | cut -d: -f1)
-line_header=$(grep -n '# EXITNODE SETUP — appended to ztnet.sh' "$SCRIPT" | tail -1 | cut -d: -f1)
+line_cd=$(grep -n '^cd /root || cd /$' "$SCRIPT" | tail -1 | cut -d: -f1)
 
 [ -n "${line_echo:-}" ] || fail "final ZTnet URL echo line not found"
-[ -n "${line_header:-}" ] || fail "ExitNode section header not found"
+[ -n "${line_cd:-}" ] || fail "appended section start (cd /root || cd /) not found"
 
-if [ "$line_header" -le "$line_echo" ]; then
-  fail "ExitNode section must be appended after final ZTnet URL echo"
+if [ "$line_cd" -le "$line_echo" ]; then
+  fail "appended section must start after final ZTnet URL echo"
 fi
-pass "ExitNode section appended after final echo"
+pass "appended section starts after final echo"
 
 # 3) All required functions are present.
 required_functions=(
   exitnode_patch_zerotier
-  exitnode_wait_api
+  exitnode_wait_ztnet
   exitnode_create_admin
   exitnode_create_network
   exitnode_configure_network
