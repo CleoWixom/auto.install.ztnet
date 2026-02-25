@@ -1,0 +1,23 @@
+name: exitnode-real-e2e
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_destructive:
+        description: "Type YES to allow real destructive ExitNode test"
+        required: true
+        default: "NO"
+
+jobs:
+  real-e2e:
+    if: ${{ github.event.inputs.run_destructive == 'YES' }}
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run real ExitNode preflight (no mocks)
+        env:
+          RUN_REAL_EXITNODE_TESTS: "1"
+          ZTNET_REAL_TEST_ALLOW_DESTRUCTIVE: "YES"
+        run: bash tests/test_exitnode_real.sh
