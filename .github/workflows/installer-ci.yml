@@ -17,3 +17,6 @@ jobs:
 
       - name: Run ExitNode structure tests
         run: bash tests/test_exitnode_section.sh
+
+      - name: Run simulated ExitNode scenario test
+        run: bash tests/test_exitnode_scenario.sh
