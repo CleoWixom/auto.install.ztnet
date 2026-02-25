@@ -957,6 +957,19 @@ setup_zerotier(){
       $STD sudo apt-get install -f -y  # Fix any dependency issues
       
       print_status "Configuring ZeroTier service..."
+
+      # Patch zerotier-one.service to run in userland mode (-U)
+      ZT_SERVICE_FILE="/lib/systemd/system/zerotier-one.service"
+      if [ -f "$ZT_SERVICE_FILE" ]; then
+          cp "$ZT_SERVICE_FILE" "${ZT_SERVICE_FILE}.bak" || true
+          if ! grep -q '^ExecStart=/usr/sbin/zerotier-one -U$' "$ZT_SERVICE_FILE"; then
+              sed -i 's|^ExecStart=/usr/sbin/zerotier-one$|ExecStart=/usr/sbin/zerotier-one -U|' "$ZT_SERVICE_FILE"
+          fi
+          if ! grep -q '^ExecStart=/usr/sbin/zerotier-one -U$' "$ZT_SERVICE_FILE"; then
+              print_status "Failed to patch zerotier-one.service with -U"
+              exit 1
+          fi
+      fi
       
       # Service management logic from official ZeroTier installer
       if [ -e /usr/bin/systemctl -o -e /usr/sbin/systemctl -o -e /sbin/systemctl -o -e /bin/systemctl ]; then
@@ -995,6 +1008,22 @@ setup_zerotier(){
       
   else
       print_status "ZeroTier is already installed."
+
+      # Ensure zerotier-one.service has -U on existing installs too
+      ZT_SERVICE_FILE="/lib/systemd/system/zerotier-one.service"
+      if [ -f "$ZT_SERVICE_FILE" ] && ! grep -q '^ExecStart=/usr/sbin/zerotier-one -U$' "$ZT_SERVICE_FILE"; then
+          cp "$ZT_SERVICE_FILE" "${ZT_SERVICE_FILE}.bak" || true
+          sed -i 's|^ExecStart=/usr/sbin/zerotier-one$|ExecStart=/usr/sbin/zerotier-one -U|' "$ZT_SERVICE_FILE"
+          if grep -q '^ExecStart=/usr/sbin/zerotier-one -U$' "$ZT_SERVICE_FILE"; then
+              if [ -d /run/systemd/system ]; then
+                  systemctl daemon-reload
+                  systemctl restart zerotier-one
+              fi
+          else
+              print_status "Failed to patch zerotier-one.service with -U"
+              exit 1
+          fi
+      fi
   fi
 }
 
